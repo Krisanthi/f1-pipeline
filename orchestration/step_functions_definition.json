@@ -1,0 +1,122 @@
+{
+  "Comment": "F1 Race Outcome Prediction Pipeline - CM2606 Data Engineering CW. Orchestrates Ingestion -> ETL -> Notification in a single execution.",
+  "StartAt": "IngestRawDataToS3",
+
+  "States": {
+
+    "IngestRawDataToS3": {
+      "Type": "Task",
+      "Comment": "Runs the ingestion Lambda which uploads F1 CSV files to the S3 raw data lake bucket.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "f1-pipeline-ingest",
+        "Payload": {
+          "raw_bucket":       "f1-pipeline-raw",
+          "processed_bucket": "f1-pipeline-processed",
+          "raw_prefix":       "f1/raw/",
+          "action":           "ingest"
+        }
+      },
+      "ResultPath": "$.ingestion_result",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException","Lambda.AWSLambdaException","Lambda.SdkClientException"],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "PipelineFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "WaitForIngestion"
+    },
+
+    "WaitForIngestion": {
+      "Type": "Wait",
+      "Comment": "Brief pause to allow S3 eventual consistency before Glue reads files.",
+      "Seconds": 5,
+      "Next": "StartGlueETLJob"
+    },
+
+    "StartGlueETLJob": {
+      "Type": "Task",
+      "Comment": "Triggers the AWS Glue PySpark ETL job for distributed transformation.",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "f1-etl-transform",
+        "Arguments": {
+          "--raw_bucket":        "f1-pipeline-raw",
+          "--processed_bucket":  "f1-pipeline-processed",
+          "--raw_prefix":        "f1/raw/",
+          "--processed_prefix":  "f1/processed/"
+        }
+      },
+      "ResultPath": "$.glue_result",
+      "Retry": [
+        {
+          "ErrorEquals": ["Glue.ConcurrentRunsExceededException"],
+          "IntervalSeconds": 60,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "PipelineFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "ValidateOutput"
+    },
+
+    "ValidateOutput": {
+      "Type": "Task",
+      "Comment": "Runs a Lambda to verify processed Parquet files exist in S3 and row counts are non-zero.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "f1-pipeline-validate",
+        "Payload": {
+          "processed_bucket": "f1-pipeline-processed",
+          "processed_prefix":  "f1/processed/",
+          "expected_tables":   ["ml_features", "dim_races", "dim_drivers", "dim_constructors", "dim_circuits"]
+        }
+      },
+      "ResultPath": "$.validation_result",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException"],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 2,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "PipelineFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "PipelineSucceeded"
+    },
+
+    "PipelineSucceeded": {
+      "Type": "Succeed",
+      "Comment": "All pipeline stages completed successfully. ML feature table available in S3 processed zone."
+    },
+
+    "PipelineFailed": {
+      "Type": "Fail",
+      "Comment": "Pipeline encountered an unrecoverable error. Check CloudWatch Logs for details.",
+      "Error":   "PipelineExecutionFailed",
+      "Cause":   "One or more pipeline stages failed. See $.error for details."
+    }
+
+  }
+}
